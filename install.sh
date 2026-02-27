@@ -1,11 +1,9 @@
 #!/bin/bash
-
 set -euo pipefail
 
 PACKAGE_NAME="zashterminal"
 DESKTOP_ID="org.leoberbert.zashterminal"
 REPO_URL="https://github.com/leoberbert/zashterminal.git"
-
 INSTALL_ROOT="/opt/${PACKAGE_NAME}"
 VENV_DIR="${INSTALL_ROOT}/venv"
 BIN_PATH="/usr/local/bin/${PACKAGE_NAME}"
@@ -16,7 +14,7 @@ LOCALE_BASE_DIR="/usr/share/locale"
 
 DISTRO_FAMILY=""
 PKG_MANAGER=""
-INSTALL_MODE="${INSTALL_MODE:-auto}"   # auto | local | aur
+INSTALL_MODE="${INSTALL_MODE:-auto}" # auto | local | aur
 ARCH_AUR_HELPER="${ARCH_AUR_HELPER:-}" # yay | paru
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
@@ -31,7 +29,6 @@ detect_system() {
   [ -r /etc/os-release ] || die "/etc/os-release not found; unsupported Linux distribution."
   # shellcheck disable=SC1091
   . /etc/os-release
-
   local key="${ID_LIKE:-} ${ID:-}"
   case " ${key} " in
     *" arch "*|*" manjaro "*)
@@ -50,11 +47,14 @@ detect_system() {
       DISTRO_FAMILY="suse"
       PKG_MANAGER="zypper"
       ;;
+    *" void "*)
+      DISTRO_FAMILY="void"
+      PKG_MANAGER="xbps"
+      ;;
     *)
       die "Unsupported distro (${ID:-unknown}). Add package mapping in install.sh."
       ;;
   esac
-
   log "Detected distro: ${PRETTY_NAME:-${ID:-unknown}} (${DISTRO_FAMILY}, ${PKG_MANAGER})"
 }
 
@@ -63,6 +63,7 @@ pkg_update_once() {
     apt) sudo apt update ;;
     pacman) sudo pacman -Syu --noconfirm ;;
     dnf|zypper) : ;;
+    xbps) sudo xbps-install -Su ;;   # sync + update (mais próximo de apt update && upgrade)
     *) die "Unsupported package manager: $PKG_MANAGER" ;;
   esac
 }
@@ -73,8 +74,8 @@ install_pkg_group() {
   shift 2
   local packages=("$@")
   local failed=()
-
   [ "${#packages[@]}" -gt 0 ] || return 0
+
   log "Installing ${group_name} packages (${#packages[@]})..."
 
   if [ "$fail_on_error" != "true" ]; then
@@ -84,6 +85,7 @@ install_pkg_group() {
         pacman) sudo pacman -S --needed --noconfirm "$pkg" >/dev/null 2>&1 || failed+=("$pkg") ;;
         dnf) sudo dnf install -y "$pkg" >/dev/null 2>&1 || failed+=("$pkg") ;;
         zypper) sudo zypper --non-interactive install "$pkg" >/dev/null 2>&1 || failed+=("$pkg") ;;
+        xbps) sudo xbps-install -y "$pkg" >/dev/null 2>&1 || failed+=("$pkg") ;;
         *) die "Unsupported package manager: $PKG_MANAGER" ;;
       esac
     done
@@ -98,6 +100,7 @@ install_pkg_group() {
     pacman) sudo pacman -S --needed --noconfirm "${packages[@]}" || failed=("${packages[@]}") ;;
     dnf) sudo dnf install -y "${packages[@]}" || failed=("${packages[@]}") ;;
     zypper) sudo zypper --non-interactive install "${packages[@]}" || failed=("${packages[@]}") ;;
+    xbps) sudo xbps-install -y "${packages[@]}" || failed=("${packages[@]}") ;;
     *) die "Unsupported package manager: $PKG_MANAGER" ;;
   esac
 
@@ -165,6 +168,25 @@ install_system_dependencies() {
         python3-py7zr python3-setproctitle python3-cryptography
       )
       ;;
+    void)
+        base_packages=(
+        python3 python3-pip git rsync sshpass gettext
+        gtk4 libadwaita
+        vte3-gtk4           # já corrigido anteriormente
+        libsecret
+        gobject-introspection python3-gobject python3-cairo
+      )
+      python_runtime_packages=(
+        python3-requests
+        python3-psutil
+        python3-Pygments    # <--- Corrigido: P maiúsculo (case-sensitive no XBPS)
+        # python3-cryptography  # Removido ou comentado → instala via pip no venv
+      )
+      optional_python_packages=(
+        python3-regex python3-py7zr python3-setproctitle
+        python3-cryptography  # Mova para cá se quiser tentar (mas deve falhar)
+      )
+      ;;
     *)
       die "No dependency mapping for distro family: $DISTRO_FAMILY"
       ;;
@@ -202,7 +224,6 @@ choose_arch_aur_helper() {
     echo "${ARCH_AUR_HELPER}"
     return 0
   fi
-
   if command -v paru >/dev/null 2>&1; then
     echo "paru"
     return 0
@@ -221,24 +242,20 @@ resolve_install_mode() {
       die "Invalid INSTALL_MODE='${INSTALL_MODE}'. Use: auto | local | aur"
       ;;
   esac
-
   if [ "${DISTRO_FAMILY}" != "arch" ]; then
     log "Install mode: local (AUR mode only applies to Arch/Manjaro)"
     return 0
   fi
-
   if [ "${INSTALL_MODE}" = "aur" ]; then
     local helper
     helper="$(choose_arch_aur_helper)" || die "INSTALL_MODE=aur requires yay or paru."
     log "Install mode: aur (${helper})"
     return 0
   fi
-
   if [ "${INSTALL_MODE}" = "local" ]; then
     log "Install mode: local"
     return 0
   fi
-
   if helper="$(choose_arch_aur_helper)"; then
     log "Install mode: aur (${helper}) [auto]"
   else
@@ -256,12 +273,10 @@ install_arch_via_aur() {
 prepare_source() {
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
   if [ -f "${script_dir}/pyproject.toml" ] && [ -d "${script_dir}/src/zashterminal" ]; then
     echo "$script_dir"
     return 0
   fi
-
   require_cmd git
   local tmp_dir
   tmp_dir="$(mktemp -d)"
@@ -274,7 +289,6 @@ compile_locales_if_possible() {
   local src_dir="$1"
   [ -d "${src_dir}/locale" ] || return 0
   command -v msgfmt >/dev/null 2>&1 || return 0
-
   log "Compiling translation files (.po -> .mo)..."
   find "${src_dir}/locale" -name '*.po' -print0 | while IFS= read -r -d '' po; do
     local lang out
@@ -289,17 +303,13 @@ install_python_app() {
   local src_dir="$1"
   local pybin
   pybin="$(python_cmd)"
-
   log "Installing application into system venv: ${VENV_DIR}"
   sudo mkdir -p "${INSTALL_ROOT}"
   sudo rm -rf "${VENV_DIR}"
   sudo "${pybin}" -m venv --system-site-packages "${VENV_DIR}"
-
   sudo "${VENV_DIR}/bin/python" -m pip install --upgrade pip >/dev/null
   sudo "${VENV_DIR}/bin/python" -m pip install --no-deps "${src_dir}" >/dev/null
-
   # Default extras in the venv (py7zr + setproctitle requested as default).
-  # They may already be available via system packages on some distros.
   sudo "${VENV_DIR}/bin/python" -m pip install \
     requests psutil regex Pygments cryptography py7zr setproctitle >/dev/null || \
     warn "Some Python packages could not be installed in the venv (continuing)."
@@ -317,13 +327,11 @@ EOF
 install_desktop_files() {
   local src_dir="$1"
   sudo mkdir -p "${APP_DIR}" "${ICON_DIR}" "${PIXMAP_DIR}"
-
   if [ -f "${src_dir}/usr/share/applications/${DESKTOP_ID}.desktop" ]; then
     sudo install -Dm644 \
       "${src_dir}/usr/share/applications/${DESKTOP_ID}.desktop" \
       "${APP_DIR}/${DESKTOP_ID}.desktop"
   fi
-
   if [ -f "${src_dir}/usr/share/icons/hicolor/scalable/apps/${PACKAGE_NAME}.svg" ]; then
     sudo install -Dm644 \
       "${src_dir}/usr/share/icons/hicolor/scalable/apps/${PACKAGE_NAME}.svg" \
@@ -332,16 +340,15 @@ install_desktop_files() {
       "${src_dir}/usr/share/icons/hicolor/scalable/apps/${PACKAGE_NAME}.svg" \
       "${PIXMAP_DIR}/${PACKAGE_NAME}.svg"
   fi
-
   sudo update-desktop-database "${APP_DIR}" >/dev/null 2>&1 || true
   sudo gtk-update-icon-cache /usr/share/icons/hicolor >/dev/null 2>&1 || true
 }
 
 post_install_notes() {
   log "Installation complete (system-wide with venv)."
-  log "  Venv: ${VENV_DIR}"
-  log "  Launcher: ${BIN_PATH}"
-  log "  Desktop: ${APP_DIR}/${DESKTOP_ID}.desktop"
+  log " Venv: ${VENV_DIR}"
+  log " Launcher: ${BIN_PATH}"
+  log " Desktop: ${APP_DIR}/${DESKTOP_ID}.desktop"
   log "Run: ${PACKAGE_NAME}"
 }
 
@@ -368,6 +375,7 @@ main() {
   install_launcher
   install_desktop_files "${src_dir}"
   compile_locales_if_possible "${src_dir}"
+
   post_install_notes
 }
 
